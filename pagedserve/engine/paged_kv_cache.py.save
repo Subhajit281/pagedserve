@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+import torch
+
+from pagedserve.engine.block_manager import BlockManager
+from pagedserve.engine.block_table import BlockTable
+from pagedserve.engine.kv_cache import KVCache
+
+
+class PagedKVCache:
+    """
+    Coordinates block allocation, logical-to-physical mapping,
+    and physical KV-cache storage.
+
+    This is the request-facing interface for the paged KV cache.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        block_size: int = 16,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda",
+    ):
+        self.block_manager = BlockManager(
+            num_blocks=num_blocks,
+            block_size=block_size,
+        )
+
+        self.kv_cache = KVCache(
+            num_blocks=num_blocks,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            dtype=dtype,
+            device=device,
+        )
+def allocate(self, request_id: str, num_tokens: int) -> None:
+    """
+    Allocate enough physical KV blocks for a request
+    and create its logical-to-physical block table.
+    """
+    if request_id in self._block_tables:
+        raise ValueError(f"Request {request_id!r} already exists")
+
+    physical_blocks = self.block_manager.allocate(
+        request_id=request_id,
+        num_tokens=num_tokens,
+    )
+
+    table = BlockTable()
+
+    for physical_block in physical_blocks:
+        table.append(physical_block)
+
+    self._block_tables[request_id] = table
+    self._token_counts[request_id] = num_tokens
+        self._block_tables: dict[str, BlockTable] = {}
+
+    def allocate(self, request_id: str, num_tokens: int) -> None:
+        """
+        Allocate enough physical KV blocks for a request
+        and create its logical-to-physical block table.
+        """
+        if request_id in self._block_tables:
+            raise ValueError(f"Request {request_id!r} already exists")
+
+        physical_blocks = self.block_manager.allocate(
+            request_id=request_id,
+            num_tokens=num_tokens,
+        )
+
+        table = BlockTable()
+
+        for physical_block in physical_blocks:
+            table.append(physical_block)
+
+        self._block_tables[request_id] = table
+
+    def get_block_table(self, request_id: str) -> BlockTable:
+        if request_id not in self._block_tables:
+            raise KeyError(f"Unknown request: {request_id!r}")
+
+        return self._block_tables[request_id]
+
+    def free(self, request_id: str) -> None:
+        if request_id not in self:
+            raise KeyError(f"Unknown request: {request_id!r}")
+
+        del self._block_tables[request_id]
+        self.block_manager.free(request_id)
+
+    @property
+    def free_blocks(self) -> int:
+        return self.block_manager.free_blocks
+
+    @property
+    def used_blocks(self) -> int:
+        return self.block_manager.used_blocks
+
+    def append_tokens(self, request_id: str, num_tokens: int) -> None:
+    """
+    Extend a request's KV-cache allocation by num_tokens.
+
+    New physical blocks are allocated only when the
+    request crosses a block boundary.
+    """
+    if request_id not in self._block_tables:
+        raise KeyError(f"Unknown request: {request_id!r}")
+
+    if num_tokens < 0:
+        raise ValueError("num_tokens cannot be negative")
+
+    if num_tokens == 0:
+        return
+
+    table = self._block_tables[request_id]
+
+    current_tokens = table.num_blocks * self.block_manager.block_size

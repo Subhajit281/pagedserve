@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import torch
+from torch import nn
+
+from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+from pagedserve.attention.paged_attention import paged_attention
+from pagedserve.attention.triton_paged_decode import triton_paged_decode_attention
+from pagedserve.engine.paged_kv_cache import PagedKVCache
+
+
+def batched_qwen_paged_attention(
+    attention: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    cache: PagedKVCache,
+    request_ids: Sequence[str],
+    positions: Sequence[int],
+    attention_backend: str = "pytorch",
+) -> torch.Tensor:
+    """
+    Run Qwen attention for a batch of independent single-token requests.
+
+    Args:
+        hidden_states: [batch_size, 1, hidden_size].
+        position_embeddings: Qwen rotary embeddings for each position.
+        request_ids: Request ID corresponding to each batch row.
+        positions: Logical token position for each request.
+
+    Returns:
+        [batch_size, 1, hidden_size].
+    """
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            "hidden_states must have shape "
+            "[batch_size, 1, hidden_size]"
+        )
+
+    batch_size, query_length, hidden_size = hidden_states.shape
+
+    if batch_size == 0:
+        raise ValueError("Batch must not be empty")
+
+    if query_length != 1:
+        raise NotImplementedError(
+            "Batched attention currently supports one token per request"
+        )
+
+    if len(request_ids) != batch_size or len(positions) != batch_size:
+        raise ValueError(
+            "request_ids and positions must match the batch size"
+        )
+
+    if len(set(request_ids)) != batch_size:
+        raise ValueError("Each batch row must have a unique request ID")
+
+    if attention_backend not in {"pytorch", "triton"}:
+        raise ValueError(
+            "attention_backend must be either 'pytorch' or 'triton'"
+        )
+
+    if hidden_size != attention.config.hidden_size:
+        raise ValueError("Hidden size does not match Qwen configuration")
+
+    num_query_heads = attention.config.num_attention_heads
+    num_kv_heads = attention.config.num_key_value_heads
+    head_dim = attention.head_dim
+
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError("Query heads must be divisible by KV heads")
+
+    for request_id, position in zip(request_ids, positions):
+        if position < 0:
+            raise ValueError("Token positions cannot be negative")
+
+        if position >= cache.token_count(request_id):
+            raise ValueError(
+                f"Position {position} exceeds allocated capacity "
+                f"for request {request_id!r}"
+            )
+
+    projection_shape = (batch_size, 1, -1, head_dim)
+
+    query_states = (
+        attention.q_proj(hidden_states)
+        .view(projection_shape)
+        .transpose(1, 2)
+    )
+
+    key_states = (
+        attention.k_proj(hidden_states)
+        .view(projection_shape)
+        .transpose(1, 2)
+    )
+
+    value_states = (
+        attention.v_proj(hidden_states)
+        .view(projection_shape)
+        .transpose(1, 2)
+    )
+
+    cos, sin = position_embeddings
+
+    query_states, key_states = apply_rotary_pos_emb(
+        query_states,
+        key_states,
+        cos,
+        sin,
+    )
+
+    # Write each row to its own logical sequence and physical blocks.
+    for row, (request_id, position) in enumerate(
+        zip(request_ids, positions)
+    ):
+        cache.write_token(
+            request_id=request_id,
+            layer=attention.layer_idx,
+            token_position=position,
+            key=key_states[row, :, 0, :],
+            value=value_states[row, :, 0, :],
+        )
+
+    if attention_backend == "triton":
+        # This function supports one token per row, so the Triton decode
+        # kernel is applicable after this layer's K/V entries are written.
+        attended = triton_paged_decode_attention(
+            query=query_states,
+            cache=cache,
+            request_ids=request_ids,
+            positions=positions,
+            layer=attention.layer_idx,
+        )
+    else:
+        # Preserve the existing PyTorch backend as the default path.
+        attended_rows = []
+
+        for row, (request_id, position) in enumerate(
+            zip(request_ids, positions)
+        ):
+            row_output = paged_attention(
+                query=query_states[row],
+                cache=cache,
+                request_id=request_id,
+                layer=attention.layer_idx,
+                query_start_position=position,
+            )
+            attended_rows.append(row_output)
+
+        attended = torch.stack(attended_rows, dim=0)
+    attended = attended.transpose(1, 2).contiguous()
+    attended = attended.reshape(batch_size, 1, hidden_size)
+
+    return attention.o_proj(attended)

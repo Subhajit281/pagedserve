@@ -1,0 +1,49 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.idea/
+.vscode/
+.env
+*.log
+data/
+models/
+results/
+
+# Python environments and tooling
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# Model weights, datasets, and runtime caches
+models/
+data/
+.cache/
+huggingface_cache/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.bin
+
+# Generated output and temporary files
+tmp/
+*.log
+.DS_Store
